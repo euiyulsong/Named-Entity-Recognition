@@ -1,4 +1,3 @@
-````markdown
 ## Qwen3.5 NER Generalization Experiment
 
 ### 실험 목적
