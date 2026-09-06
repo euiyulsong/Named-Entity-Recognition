@@ -94,8 +94,8 @@ EVAL_BATCH_SIZE = 64
 LEARNING_RATE = 2e-5
 
 # QUICK mode limits
-MAX_TRAIN = 2000 if QUICK else None
-MAX_EVAL = 1000 if QUICK else None
+MAX_TRAIN = 1000 if QUICK else None
+MAX_EVAL = 100 if QUICK else None
 
 
 # ============================================================
