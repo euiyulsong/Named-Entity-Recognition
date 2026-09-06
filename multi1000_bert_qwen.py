@@ -126,12 +126,12 @@ MULTI_TRAIN_N = (
 
 BERT_EPOCHS = (
     1 if QUICK
-    else 4
+    else 1
 )
 
 QWEN_EPOCHS = (
     1 if QUICK
-    else 3
+    else 1
 )
 
 MAX_EVAL = (
