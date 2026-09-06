@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 import os, re, gc, json, time, math, random, argparse, urllib.request
 from collections import defaultdict
 
@@ -317,29 +317,82 @@ def char_chunks(row, chunk_size=900, overlap=150):
     return out
 
 def qwen_prompt(text,labels):
-    return ("Extract all named entities from TEXT. Nested and overlapping entities are allowed.\n"
-            "Allowed labels: "+", ".join(labels)+"\n"
-            "Offsets are relative to TEXT below; start inclusive, end exclusive.\n"
-            "Return ONLY JSON: [{\"start\":0,\"end\":4,\"label\":\"PERSON\"}]. If none, return [].\nTEXT:\n"+text)
+    # Compact schema cuts generation length substantially.
+    # Each item is [start, end, label]. Offsets are local to this chunk.
+    return (
+        "NER task. Extract every entity, including nested/overlapping entities.\n"
+        "Allowed labels: " + ", ".join(labels) + "\n"
+        "Offsets are CHARACTER offsets in TEXT: start inclusive, end exclusive.\n"
+        "Return ONLY one compact JSON array. Each item must be [start,end,\"LABEL\"]. "
+        "No explanation. If none, return [].\nTEXT:\n" + text
+    )
+
 
 def target_json(ents,labels):
-    labs=set(labels); x=[{"start":int(e["start"]),"end":int(e["end"]),"label":e["label"]} for e in ents if e["label"] in labs]
-    x.sort(key=lambda z:(z["start"],z["end"],z["label"])); return json.dumps(x,ensure_ascii=False,separators=(",",":"))
+    labs=set(labels)
+    x=[[int(e["start"]),int(e["end"]),e["label"]] for e in ents if e["label"] in labs]
+    x.sort(key=lambda z:(z[0],z[1],z[2]))
+    return json.dumps(x,ensure_ascii=False,separators=(",",":"))
+
 
 def parse_json_entities(raw,labels,text):
-    raw=raw.strip(); raw=re.sub(r"^```(?:json)?\s*","",raw,flags=re.I); raw=re.sub(r"\s*```$","",raw)
+    """Parse complete JSON, and salvage complete items from truncated generations.
+
+    Accepts both compact [start,end,label] items and old dict items.
+    Returns (spans, parsed_anything). A truncated array is not thrown away if it
+    contains complete valid entity records.
+    """
+    labs=set(labels)
+    raw=raw.strip()
+    raw=re.sub(r"^```(?:json)?\s*","",raw,flags=re.I)
+    raw=re.sub(r"\s*```$","",raw)
+
+    def add_item(x,out):
+        try:
+            if isinstance(x,(list,tuple)) and len(x)>=3:
+                st,en,lab=int(x[0]),int(x[1]),str(x[2])
+            elif isinstance(x,dict):
+                st,en,lab=int(x["start"]),int(x["end"]),str(x["label"])
+            else:
+                return
+        except Exception:
+            return
+        if lab in labs and 0 <= st < en <= len(text):
+            out.add((st,en,lab))
+
+    # First try strict JSON.
+    candidates=[raw]
     m=re.search(r"\[.*\]",raw,re.S)
-    if m: raw=m.group(0)
-    try: data=json.loads(raw)
-    except Exception: return set(),False
-    if not isinstance(data,list): return set(),False
-    labs=set(labels); out=set()
-    for x in data:
-        if not isinstance(x,dict): continue
-        try: s=int(x["start"]); e=int(x["end"]); lab=str(x["label"])
-        except Exception: continue
-        if lab in labs and 0<=s<e<=len(text): out.add((s,e,lab))
-    return out,True
+    if m and m.group(0)!=raw:
+        candidates.append(m.group(0))
+    for cand in candidates:
+        try:
+            data=json.loads(cand)
+            if isinstance(data,list):
+                out=set()
+                for x in data:
+                    add_item(x,out)
+                return out,True
+        except Exception:
+            pass
+
+    # Salvage compact triplets from an incomplete/truncated array.
+    out=set()
+    compact_pat=re.compile(r'\[\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*["\']([^"\']+)["\']\s*\]')
+    for mm in compact_pat.finditer(raw):
+        add_item([mm.group(1),mm.group(2),mm.group(3)],out)
+
+    # Also salvage legacy object format.
+    obj_pat=re.compile(
+        r'\{[^{}]*?["\']start["\']\s*:\s*(-?\d+)[^{}]*?'
+        r'["\']end["\']\s*:\s*(-?\d+)[^{}]*?'
+        r'["\']label["\']\s*:\s*["\']([^"\']+)["\'][^{}]*?\}',
+        re.S,
+    )
+    for mm in obj_pat.finditer(raw):
+        add_item([mm.group(1),mm.group(2),mm.group(3)],out)
+
+    return out, bool(out)
 
 def load_qwen(name):
     proc=AutoProcessor.from_pretrained(name)
@@ -404,33 +457,83 @@ class CausalCollator:
         return {"input_ids":ids,"attention_mask":am,"labels":labs}
 
 def add_lora(model,r):
-    cand=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj","in_proj_qkv","in_proj_z","in_proj_a","in_proj_b","out_proj"]
+    # Keep LoRA on attention / linear-attention projections. MLP LoRA is omitted
+    # here because it raises activation memory substantially for little benefit in
+    # this benchmark.
+    cand=["q_proj","k_proj","v_proj","o_proj",
+          "in_proj_qkv","in_proj_z","in_proj_a","in_proj_b","out_proj"]
     existing={n.split(".")[-1] for n,m in model.named_modules() if isinstance(m,nn.Linear)}
     targets=[x for x in cand if x in existing]
-    if not targets: raise RuntimeError("Could not find LoRA target Linear modules")
+    if not targets:
+        raise RuntimeError("Could not find LoRA target Linear modules")
     print("LoRA targets:",targets)
     cfg=LoraConfig(r=r,lora_alpha=2*r,lora_dropout=.05,bias="none",task_type="CAUSAL_LM",target_modules=targets)
-    model=get_peft_model(model,cfg); model.print_trainable_parameters(); return model
+    model=get_peft_model(model,cfg)
+    model.print_trainable_parameters()
+    return model
+
+
+def choose_qwen_microbatch(args):
+    """Treat --qwen-batch-size as requested effective examples/optimizer-step.
+
+    A 24 GB 4090 cannot backprop batch=24 at ~1k tokens through this model. We
+    cap the physical microbatch and automatically increase accumulation so the
+    requested effective batch is preserved as closely as possible.
+    """
+    requested=max(1,int(args.qwen_batch_size))
+    cap=max(1,int(args.qwen_micro_batch_cap))
+    micro=min(requested,cap)
+    auto_accum=math.ceil(requested/micro)
+    accum=max(1,int(args.qwen_grad_acc))*auto_accum
+    effective=micro*accum
+    print(f"Qwen batching: requested={requested}, micro_batch={micro}, grad_acc={accum}, effective_batch={effective}")
+    return micro,accum
+
 
 def train_qwen(model,proc,rows,labels,args):
     model=add_lora(model,args.lora_r)
-    if hasattr(model.config,"use_cache"): model.config.use_cache=False
-    try: model.gradient_checkpointing_enable()
-    except Exception: pass
-    ds=QwenChunkDataset(rows,proc,labels,args); dl=DataLoader(ds,batch_size=args.qwen_batch_size,shuffle=True,collate_fn=CausalCollator(proc.tokenizer.pad_token_id),num_workers=0)
-    params=[p for p in model.parameters() if p.requires_grad]; opt=torch.optim.AdamW(params,lr=args.qwen_lr,weight_decay=.01)
-    use_amp=torch.cuda.is_available(); accum=max(1,args.qwen_grad_acc); opt.zero_grad(set_to_none=True)
+    if hasattr(model.config,"use_cache"):
+        model.config.use_cache=False
+    try:
+        model.gradient_checkpointing_enable()
+    except Exception as exc:
+        print("gradient checkpoint warning:",exc)
+    # Important for PEFT + gradient checkpointing on some Transformers versions.
+    try:
+        model.enable_input_require_grads()
+    except Exception:
+        pass
+
+    ds=QwenChunkDataset(rows,proc,labels,args)
+    micro,accum=choose_qwen_microbatch(args)
+    dl=DataLoader(ds,batch_size=micro,shuffle=True,
+                  collate_fn=CausalCollator(proc.tokenizer.pad_token_id),num_workers=0)
+    params=[p for p in model.parameters() if p.requires_grad]
+    opt=torch.optim.AdamW(params,lr=args.qwen_lr,weight_decay=.01)
+    opt.zero_grad(set_to_none=True)
+
     for ep in range(args.qwen_epochs):
-        model.train(); bar=tqdm(dl,desc=f"QWEN-LORA {ep+1}/{args.qwen_epochs}")
+        model.train()
+        bar=tqdm(dl,desc=f"QWEN-LORA {ep+1}/{args.qwen_epochs}")
         for step,b in enumerate(bar,1):
-            dev=next(model.parameters()).device; b={k:v.to(dev) for k,v in b.items()}
-            with torch.autocast(device_type="cuda",dtype=torch.bfloat16,enabled=use_amp and torch.cuda.is_bf16_supported()):
-                out=model(**b); loss=out.loss/accum
+            dev=next(model.parameters()).device
+            b={k:v.to(dev,non_blocking=True) for k,v in b.items()}
+            amp_enabled=torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            with torch.autocast(device_type="cuda",dtype=torch.bfloat16,enabled=amp_enabled):
+                out=model(**b)
+                loss=out.loss/accum
             loss.backward()
             if step%accum==0 or step==len(dl):
-                torch.nn.utils.clip_grad_norm_(params,1.); opt.step(); opt.zero_grad(set_to_none=True)
+                torch.nn.utils.clip_grad_norm_(params,1.)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
             bar.set_postfix(loss=f"{loss.item()*accum:.4f}")
-    if hasattr(model.config,"use_cache"): model.config.use_cache=True
+            del out,loss,b
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if hasattr(model.config,"use_cache"):
+        model.config.use_cache=True
     return model
 
 # ----------------------------- result -----------------------------
@@ -452,8 +555,12 @@ def main():
     ap.add_argument("--bert-max-length",type=int,default=256); ap.add_argument("--bert-stride",type=int,default=96); ap.add_argument("--thresholds",default="0.15,0.20,0.25,0.30,0.35,0.40,0.50"); ap.add_argument("--max-pos-weight",type=float,default=50.)
     ap.add_argument("--crf-aux-weight",type=float,default=.5)
     ap.add_argument("--qwen-model",default="Qwen/Qwen3.5-0.8B"); ap.add_argument("--qwen-epochs",type=int,default=3); ap.add_argument("--qwen-batch-size",type=int,default=2); ap.add_argument("--qwen-grad-acc",type=int,default=8); ap.add_argument("--qwen-lr",type=float,default=1e-4); ap.add_argument("--lora-r",type=int,default=16)
-    ap.add_argument("--qwen-chunk-chars",type=int,default=900); ap.add_argument("--qwen-chunk-overlap",type=int,default=150); ap.add_argument("--qwen-max-length",type=int,default=1536); ap.add_argument("--qwen-max-new-tokens",type=int,default=256)
-    ap.add_argument("--skip-sigmoid",action="store_true"); ap.add_argument("--skip-crf",action="store_true"); ap.add_argument("--skip-zero-shot",action="store_true"); ap.add_argument("--skip-qwen-ft",action="store_true")
+    ap.add_argument("--qwen-chunk-chars",type=int,default=600); ap.add_argument("--qwen-chunk-overlap",type=int,default=120); ap.add_argument("--qwen-max-length",type=int,default=1024); ap.add_argument("--qwen-max-new-tokens",type=int,default=384)
+    ap.add_argument("--qwen-micro-batch-cap",type=int,default=2,help="physical Qwen microbatch cap; --qwen-batch-size is treated as requested effective batch")
+    ap.add_argument("--skip-sigmoid","--skip_sigmoid",dest="skip_sigmoid",action="store_true")
+    ap.add_argument("--skip-crf","--skip_crf",dest="skip_crf",action="store_true")
+    ap.add_argument("--skip-zero-shot","--skip_zero_shot",dest="skip_zero_shot",action="store_true")
+    ap.add_argument("--skip-qwen-ft","--skip_qwen_ft",dest="skip_qwen_ft",action="store_true")
     args=ap.parse_args(); seed_all(args.seed); dev=device_name()
     print("="*100+"\nMULTI-LABEL / NESTED NER BENCHMARK\n"+"="*100); print("device:",dev)
     train,valid,test=load_runne(args); labels=labels_from_train(train); print_stats(train,valid,test,labels); results={}
@@ -492,6 +599,8 @@ def main():
         print("\n"+"="*100+"\n3. QWEN3.5-0.8B ZERO-SHOT (CHUNKED)\n"+"="*100)
         r=eval_qwen(qm,qp,test,labels,args,"Qwen zero-shot"); results["Qwen3.5-0.8B zero-shot"]=r
         print("zero-shot examples:"); [print(x) for x in r["examples"][:3]]
+        gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     if not args.skip_qwen_ft:
         print("\n"+"="*100+"\n4. QWEN3.5-0.8B LoRA (CHUNKED)\n"+"="*100)
