@@ -1,5 +1,6 @@
-# NER Model Comparison — CoNLL-2003
 
+# NER Model Comparison — CoNLL-2003
+<img width="2200" height="1400" alt="positive_negative_distribution" src="https://github.com/user-attachments/assets/bf558223-ca9f-452f-bcb2-d69561e0e60b" />
 ## 1. Experiment Overview
 
 CoNLL-2003를 이용해 네 가지 NER 모델을 비교했다.
