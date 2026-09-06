@@ -37,7 +37,7 @@ from peft import (
 # CONFIG
 # ============================================================
 
-DEFAULT_LLM = "Qwen/Qwen3-4B-Instruct"
+DEFAULT_LLM = "Qwen/Qwen3.5-0.8B"
 DEFAULT_ENCODER = "microsoft/deberta-v3-base"
 
 DATA_DIR = Path("./multiturn_ner_data")
@@ -176,133 +176,94 @@ def is_user_turn(turn):
     return str(speaker).upper() == "USER"
 
 
-def extract_slot_values(frame):
-    """
-    Robustly parse HuggingFace MultiWOZ 2.2 representation.
+def unpack_sequence(seq):
+    if seq is None:
+        return []
 
-    Typical:
+    if isinstance(seq, list):
+        return seq
 
-    state["slots_values"] = {
-        "slots_values_name": [
-            "hotel-area",
-            "hotel-pricerange"
-        ],
-        "slots_values_list": [
-            ["north"],
-            ["cheap"]
+    if isinstance(seq, dict):
+        if not seq:
+            return []
+
+        lengths = [
+            len(v)
+            for v in seq.values()
+            if isinstance(v, list)
         ]
-    }
-    """
 
+        if not lengths:
+            return []
+
+        n = min(lengths)
+
+        return [
+            {
+                key: (
+                    value[i]
+                    if isinstance(value, list)
+                    else value
+                )
+                for key, value in seq.items()
+            }
+            for i in range(n)
+        ]
+
+    raise TypeError(
+        f"Unexpected sequence type: {type(seq)}"
+    )
+
+
+def extract_slot_values(frame):
     state = frame.get("state") or {}
-    sv = state.get("slots_values") or {}
+
+    slot_values = unpack_sequence(
+        state.get("slots_values", [])
+    )
 
     result = {}
 
-    # --------------------------------------------------------
-    # Form 1:
-    # {
-    #   slots_values_name: [...],
-    #   slots_values_list: [[...], [...]]
-    # }
-    # --------------------------------------------------------
+    for item in slot_values:
 
-    if isinstance(sv, dict):
+        if not isinstance(item, dict):
+            continue
 
-        names = sv.get(
-            "slots_values_name",
-            []
+        slot = item.get(
+            "slots_values_name"
         )
 
-        values = sv.get(
+        values = item.get(
             "slots_values_list",
             []
         )
 
-        if isinstance(names, str):
-            names = [names]
+        if isinstance(values, str):
+            values = [values]
 
-        for slot, vals in zip(
-            names,
-            values,
-        ):
+        if not slot or not values:
+            continue
 
-            if isinstance(vals, str):
-                vals = [vals]
+        value = normalize_text(
+            values[0]
+        )
 
-            if not vals:
-                continue
+        slot = normalize_slot(slot)
 
-            value = vals[0]
+        if value in IGNORE_VALUES:
+            continue
 
-            slot = normalize_slot(slot)
-            value = normalize_text(value)
-
-            if value in IGNORE_VALUES:
-                continue
-
-            result[slot] = value
-
-    # --------------------------------------------------------
-    # Form 2:
-    # [
-    #   {
-    #     slots_values_name: "...",
-    #     slots_values_list: [...]
-    #   }
-    # ]
-    # --------------------------------------------------------
-
-    elif isinstance(sv, list):
-
-        for item in sv:
-
-            if not isinstance(
-                item,
-                dict,
-            ):
-                continue
-
-            slot = item.get(
-                "slots_values_name"
-            )
-
-            vals = item.get(
-                "slots_values_list",
-                []
-            )
-
-            if isinstance(vals, str):
-                vals = [vals]
-
-            if (
-                slot
-                and vals
-            ):
-                slot = normalize_slot(slot)
-
-                value = normalize_text(
-                    vals[0]
-                )
-
-                if value not in IGNORE_VALUES:
-                    result[slot] = value
+        result[slot] = value
 
     return result
 
 
 def extract_belief_state(turn):
-    """
-    Combine all service frames into a single accumulated
-    slot -> value state.
-    """
-
     state = {}
 
-    frames = turn.get(
-        "frames",
-        []
-    ) or []
+    frames = unpack_sequence(
+        turn.get("frames", [])
+    )
 
     for frame in frames:
 
@@ -310,11 +271,9 @@ def extract_belief_state(turn):
             frame
         )
 
-        for slot, value in local.items():
-            state[slot] = value
+        state.update(local)
 
     return state
-
 
 def make_context(
     history,
@@ -418,9 +377,8 @@ def build_examples(
 
     ds = load_dataset(
         "pfb30/multi_woz_v22",
-        "v2.2",
+        "v2.2_active_only",
         split=split,
-        trust_remote_code=True,
     )
 
     examples = []
@@ -447,8 +405,12 @@ def build_examples(
             len(set(services)) >= 2
         )
 
-        for turn_index, turn in enumerate(
+        turns = unpack_sequence(
             dialogue["turns"]
+        )
+
+        for turn_index, turn in enumerate(
+            turns
         ):
 
             utterance = (
@@ -468,6 +430,7 @@ def build_examples(
                 turn
             )
 
+            # 이하 기존 코드 그대로
             if not state:
 
                 history.append(
@@ -1084,35 +1047,44 @@ def load_llm(
 
 
 @torch.inference_mode()
-def llm_generate_one(
+def llm_generate_batch(
     tokenizer,
     model,
-    prompt,
+    prompts,
     max_new_tokens=256,
 ):
-    messages = [{
-        "role": "user",
-        "content": prompt,
-    }]
+    """Generate a batch of JSON answers for LLM evaluation."""
+    if not prompts:
+        return []
 
-    rendered = (
-        tokenizer
-        .apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
+    rendered = []
+    for prompt in prompts:
+        messages = [{
+            "role": "user",
+            "content": prompt,
+        }]
+        rendered.append(
+            tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         )
-    )
+
+    # Decoder-only batched generation should left-pad.
+    old_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
 
     inputs = tokenizer(
         rendered,
         return_tensors="pt",
+        padding=True,
+        truncation=True,
     )
 
-    device = next(
-        model.parameters()
-    ).device
+    tokenizer.padding_side = old_padding_side
 
+    device = next(model.parameters()).device
     inputs = {
         k: v.to(device)
         for k, v in inputs.items()
@@ -1123,29 +1095,37 @@ def llm_generate_one(
         do_sample=False,
         temperature=None,
         top_p=None,
-        max_new_tokens=
-            max_new_tokens,
-        pad_token_id=
-            tokenizer.pad_token_id,
-        eos_token_id=
-            tokenizer.eos_token_id,
+        max_new_tokens=max_new_tokens,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
     )
 
-    generated = outputs[
-        0,
-        inputs[
-            "input_ids"
-        ].shape[1]:
-    ]
+    # All padded input rows have the same tensor length.
+    input_len = inputs["input_ids"].shape[1]
+    generated = outputs[:, input_len:]
 
-    return tokenizer.decode(
+    return tokenizer.batch_decode(
         generated,
         skip_special_tokens=True,
     )
 
 
-def run_llm_zero(args):
+@torch.inference_mode()
+def llm_generate_one(
+    tokenizer,
+    model,
+    prompt,
+    max_new_tokens=256,
+):
+    return llm_generate_batch(
+        tokenizer,
+        model,
+        [prompt],
+        max_new_tokens=max_new_tokens,
+    )[0]
 
+
+def run_llm_zero(args):
     slots = load_json(
         DATA_DIR / "slots.json"
     )
@@ -1161,10 +1141,8 @@ def run_llm_zero(args):
 
     examples = read_jsonl(path)
 
-    if args.max_eval:
-        examples = examples[
-            :args.max_eval
-        ]
+    if args.max_eval is not None:
+        examples = examples[:args.max_eval]
 
     tokenizer, model = load_llm(
         args.llm_model,
@@ -1174,41 +1152,38 @@ def run_llm_zero(args):
     predictions = []
     details = []
 
-    for x in tqdm(
-        examples,
-        desc="LLM zero-shot",
+    batch_size = max(1, args.eval_batch_size)
+
+    for start in tqdm(
+        range(0, len(examples), batch_size),
+        desc="LLM zero-shot batches",
     ):
+        batch_examples = examples[
+            start:start + batch_size
+        ]
 
-        prompt = build_llm_prompt(
-            x,
-            slots,
-        )
+        prompts = [
+            build_llm_prompt(x, slots)
+            for x in batch_examples
+        ]
 
-        raw = llm_generate_one(
+        raws = llm_generate_batch(
             tokenizer,
             model,
-            prompt,
+            prompts,
             args.max_new_tokens,
         )
 
-        pred = parse_json_object(
-            raw
-        )
-
-        predictions.append(pred)
-
-        details.append({
-            "dialogue_id":
-                x["dialogue_id"],
-            "turn_id":
-                x["turn_id"],
-            "gold":
-                x["state"],
-            "pred":
-                pred,
-            "raw":
-                raw,
-        })
+        for x, raw in zip(batch_examples, raws):
+            pred = parse_json_object(raw)
+            predictions.append(pred)
+            details.append({
+                "dialogue_id": x["dialogue_id"],
+                "turn_id": x["turn_id"],
+                "gold": x["state"],
+                "pred": pred,
+                "raw": raw,
+            })
 
     RESULT_DIR.mkdir(
         parents=True,
@@ -1217,8 +1192,7 @@ def run_llm_zero(args):
 
     write_jsonl(
         details,
-        RESULT_DIR
-        / "llm_zero_details.jsonl",
+        RESULT_DIR / "llm_zero_details.jsonl",
     )
 
     df = print_results(
@@ -1228,8 +1202,7 @@ def run_llm_zero(args):
     )
 
     df.to_csv(
-        RESULT_DIR
-        / "llm_zero_metrics.csv",
+        RESULT_DIR / "llm_zero_metrics.csv",
         index=False,
     )
 
@@ -1574,7 +1547,6 @@ def train_llm(args):
 # ============================================================
 
 def run_llm_sft_eval(args):
-
     slots = load_json(
         DATA_DIR / "slots.json"
     )
@@ -1588,107 +1560,82 @@ def run_llm_sft_eval(args):
         )
     )
 
-    if args.max_eval:
-        examples = examples[
-            :args.max_eval
-        ]
+    if args.max_eval is not None:
+        examples = examples[:args.max_eval]
 
-    tokenizer = (
-        AutoTokenizer
-        .from_pretrained(
-            args.llm_output
-        )
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.llm_output
     )
 
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = (
-            tokenizer.eos_token
-        )
+        tokenizer.pad_token = tokenizer.eos_token
 
     kwargs = {
         "device_map": "auto",
     }
 
     if args.llm_4bit:
-
-        kwargs[
-            "quantization_config"
-        ] = BitsAndBytesConfig(
+        kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=
-                torch.bfloat16,
-            bnb_4bit_quant_type=
-                "nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
         )
-
     else:
-
-        kwargs[
-            "torch_dtype"
-        ] = (
+        kwargs["torch_dtype"] = (
             torch.bfloat16
             if torch.cuda.is_available()
             else torch.float32
         )
 
-    base = (
-        AutoModelForCausalLM
-        .from_pretrained(
-            args.llm_model,
-            **kwargs,
-        )
+    base = AutoModelForCausalLM.from_pretrained(
+        args.llm_model,
+        **kwargs,
     )
 
     model = PeftModel.from_pretrained(
         base,
         args.llm_output,
     )
-
     model.eval()
 
     predictions = []
     details = []
+    batch_size = max(1, args.eval_batch_size)
 
-    for x in tqdm(
-        examples,
-        desc="LLM SFT eval",
+    for start in tqdm(
+        range(0, len(examples), batch_size),
+        desc="LLM SFT eval batches",
     ):
+        batch_examples = examples[
+            start:start + batch_size
+        ]
 
-        prompt = build_llm_prompt(
-            x,
-            slots,
-        )
+        prompts = [
+            build_llm_prompt(x, slots)
+            for x in batch_examples
+        ]
 
-        raw = llm_generate_one(
+        raws = llm_generate_batch(
             tokenizer,
             model,
-            prompt,
+            prompts,
             args.max_new_tokens,
         )
 
-        pred = parse_json_object(
-            raw
-        )
-
-        predictions.append(pred)
-
-        details.append({
-            "dialogue_id":
-                x["dialogue_id"],
-            "turn_id":
-                x["turn_id"],
-            "gold":
-                x["state"],
-            "pred":
-                pred,
-            "raw":
-                raw,
-        })
+        for x, raw in zip(batch_examples, raws):
+            pred = parse_json_object(raw)
+            predictions.append(pred)
+            details.append({
+                "dialogue_id": x["dialogue_id"],
+                "turn_id": x["turn_id"],
+                "gold": x["state"],
+                "pred": pred,
+                "raw": raw,
+            })
 
     write_jsonl(
         details,
-        RESULT_DIR
-        / "llm_sft_details.jsonl",
+        RESULT_DIR / "llm_sft_details.jsonl",
     )
 
     df = print_results(
@@ -1698,8 +1645,7 @@ def run_llm_sft_eval(args):
     )
 
     df.to_csv(
-        RESULT_DIR
-        / "llm_sft_metrics.csv",
+        RESULT_DIR / "llm_sft_metrics.csv",
         index=False,
     )
 
@@ -2110,6 +2056,155 @@ def train_encoder(args):
 # ============================================================
 
 @torch.inference_mode()
+def qa_score_batch(
+    model,
+    tokenizer,
+    slots,
+    contexts,
+    max_length=512,
+    max_answer_tokens=12,
+):
+    """Score a batch of (slot, context) QA pairs."""
+    if not slots:
+        return []
+
+    questions = [
+        f"Find the value for slot {slot}."
+        for slot in slots
+    ]
+
+    enc = tokenizer(
+        questions,
+        contexts,
+        max_length=max_length,
+        truncation="only_second",
+        padding=True,
+        return_offsets_mapping=True,
+        return_tensors="pt",
+    )
+
+    offsets_batch = enc["offset_mapping"].tolist()
+    seq_ids_batch = [
+        enc.sequence_ids(i)
+        for i in range(len(slots))
+    ]
+
+    model_inputs = {
+        k: v.to(model.device)
+        for k, v in enc.items()
+        if k != "offset_mapping"
+    }
+
+    out = model(**model_inputs)
+    start_batch = out.start_logits.float().cpu()
+    end_batch = out.end_logits.float().cpu()
+
+    results = []
+
+    for b in range(len(slots)):
+        offsets = offsets_batch[b]
+        seq_ids = seq_ids_batch[b]
+        start_logits = start_batch[b]
+        end_logits = end_batch[b]
+
+        # CLS is token 0 for these encoders.
+        null_score = (
+            start_logits[0].item()
+            + end_logits[0].item()
+        )
+
+        context_tokens = [
+            i
+            for i, seq in enumerate(seq_ids)
+            if seq == 1
+            and offsets[i][1] > offsets[i][0]
+        ]
+
+        if not context_tokens:
+            results.append({
+                "value": "",
+                "margin": -1e9,
+                "best_score": -1e9,
+                "null_score": null_score,
+            })
+            continue
+
+        k = min(25, len(context_tokens))
+
+        masked_start = torch.full_like(
+            start_logits,
+            -1e9,
+        )
+        masked_end = torch.full_like(
+            end_logits,
+            -1e9,
+        )
+
+        for i in context_tokens:
+            masked_start[i] = start_logits[i]
+            masked_end[i] = end_logits[i]
+
+        top_starts = torch.topk(
+            masked_start,
+            k=k,
+        ).indices.tolist()
+
+        top_ends = torch.topk(
+            masked_end,
+            k=k,
+        ).indices.tolist()
+
+        best_score = -1e30
+        best_span = None
+
+        for s in top_starts:
+            for e in top_ends:
+                if e < s:
+                    continue
+                if e - s + 1 > max_answer_tokens:
+                    continue
+                if seq_ids[s] != 1 or seq_ids[e] != 1:
+                    continue
+
+                score = (
+                    start_logits[s].item()
+                    + end_logits[e].item()
+                )
+
+                if score > best_score:
+                    best_score = score
+                    best_span = (s, e)
+
+        if best_span is None:
+            results.append({
+                "value": "",
+                "margin": -1e9,
+                "best_score": best_score,
+                "null_score": null_score,
+            })
+            continue
+
+        s, e = best_span
+        char_start = offsets[s][0]
+        char_end = offsets[e][1]
+
+        value = contexts[b][
+            char_start:char_end
+        ].strip()
+
+        margin = best_score - null_score
+
+        results.append({
+            "value": normalize_text(value),
+            "margin": margin,
+            "best_score": best_score,
+            "null_score": null_score,
+        })
+
+    return results
+
+
+@torch.inference_mode()
 def qa_score_slot(
     model,
     tokenizer,
@@ -2118,186 +2213,14 @@ def qa_score_slot(
     max_length=512,
     max_answer_tokens=12,
 ):
-    question = (
-        f"Find the value for slot {slot}."
-    )
-
-    enc = tokenizer(
-        question,
-        context,
+    return qa_score_batch(
+        model,
+        tokenizer,
+        [slot],
+        [context],
         max_length=max_length,
-        truncation="only_second",
-        return_offsets_mapping=True,
-        return_tensors="pt",
-    )
-
-    offsets = enc[
-        "offset_mapping"
-    ][0].tolist()
-
-    seq_ids = (
-        enc.sequence_ids(0)
-    )
-
-    model_inputs = {
-        k: v.to(
-            model.device
-        )
-        for k, v in enc.items()
-        if k != "offset_mapping"
-    }
-
-    out = model(
-        **model_inputs
-    )
-
-    start_logits = (
-        out.start_logits[0]
-        .float()
-        .cpu()
-    )
-
-    end_logits = (
-        out.end_logits[0]
-        .float()
-        .cpu()
-    )
-
-    # CLS no-answer score
-    null_score = (
-        start_logits[0].item()
-        + end_logits[0].item()
-    )
-
-    context_tokens = [
-        i
-        for i, seq in enumerate(
-            seq_ids
-        )
-        if seq == 1
-        and offsets[i][1]
-        > offsets[i][0]
-    ]
-
-    if not context_tokens:
-        return {
-            "value": "",
-            "margin": -1e9,
-            "best_score": -1e9,
-            "null_score":
-                null_score,
-        }
-
-    # Top-k candidate positions
-    k = min(
-        25,
-        len(context_tokens),
-    )
-
-    masked_start = (
-        torch.full_like(
-            start_logits,
-            -1e9,
-        )
-    )
-
-    masked_end = (
-        torch.full_like(
-            end_logits,
-            -1e9,
-        )
-    )
-
-    for i in context_tokens:
-        masked_start[i] = (
-            start_logits[i]
-        )
-        masked_end[i] = (
-            end_logits[i]
-        )
-
-    top_starts = (
-        torch.topk(
-            masked_start,
-            k=k,
-        ).indices.tolist()
-    )
-
-    top_ends = (
-        torch.topk(
-            masked_end,
-            k=k,
-        ).indices.tolist()
-    )
-
-    best_score = -1e30
-    best_span = None
-
-    for s in top_starts:
-        for e in top_ends:
-
-            if e < s:
-                continue
-
-            if (
-                e - s + 1
-                > max_answer_tokens
-            ):
-                continue
-
-            if (
-                seq_ids[s] != 1
-                or seq_ids[e] != 1
-            ):
-                continue
-
-            score = (
-                start_logits[s].item()
-                + end_logits[e].item()
-            )
-
-            if score > best_score:
-                best_score = score
-                best_span = (
-                    s,
-                    e,
-                )
-
-    if best_span is None:
-
-        return {
-            "value": "",
-            "margin": -1e9,
-            "best_score":
-                best_score,
-            "null_score":
-                null_score,
-        }
-
-    s, e = best_span
-
-    char_start = offsets[s][0]
-    char_end = offsets[e][1]
-
-    value = context[
-        char_start:char_end
-    ].strip()
-
-    margin = (
-        best_score
-        - null_score
-    )
-
-    return {
-        "value":
-            normalize_text(value),
-        "margin":
-            margin,
-        "best_score":
-            best_score,
-        "null_score":
-            null_score,
-    }
+        max_answer_tokens=max_answer_tokens,
+    )[0]
 
 
 def encoder_raw_predictions(
@@ -2308,37 +2231,46 @@ def encoder_raw_predictions(
     args,
 ):
     """
-    Compute each slot's predicted span and confidence margin.
-    Threshold will be applied later.
+    Batched inference over all (dialogue example, slot) pairs.
+    The returned shape stays identical to the original code:
+        list[dict[slot] -> score_result]
     """
+    raw = [dict() for _ in rows]
 
-    raw = []
-
-    for row in tqdm(
-        rows,
-        desc="Encoder inference",
-    ):
-
-        slot_scores = {}
-
+    flat = []
+    for row_idx, row in enumerate(rows):
         for slot in slots:
-
-            result = qa_score_slot(
-                model,
-                tokenizer,
+            flat.append((
+                row_idx,
                 slot,
                 row["context"],
-                max_length=
-                    args.encoder_max_length,
-                max_answer_tokens=
-                    args.max_answer_tokens,
-            )
+            ))
 
-            slot_scores[slot] = result
+    batch_size = max(1, args.eval_batch_size)
 
-        raw.append(
-            slot_scores
+    for start in tqdm(
+        range(0, len(flat), batch_size),
+        desc="Encoder QA batches",
+    ):
+        batch = flat[start:start + batch_size]
+
+        batch_slots = [x[1] for x in batch]
+        batch_contexts = [x[2] for x in batch]
+
+        results = qa_score_batch(
+            model,
+            tokenizer,
+            batch_slots,
+            batch_contexts,
+            max_length=args.encoder_max_length,
+            max_answer_tokens=args.max_answer_tokens,
         )
+
+        for (row_idx, slot, _), result in zip(
+            batch,
+            results,
+        ):
+            raw[row_idx][slot] = result
 
     return raw
 
@@ -2900,13 +2832,22 @@ def get_args():
     p.add_argument(
         "--max-val",
         type=int,
-        default=None,
+        default=100,
+        help="Validation examples used for encoder threshold tuning (default: 100).",
     )
 
     p.add_argument(
         "--max-eval",
         type=int,
-        default=None,
+        default=100,
+        help="Maximum number of test examples to evaluate (default: 100). Use 0 for all.",
+    )
+
+    p.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=100,
+        help="Inference batch size for LLM and encoder evaluation (default: 100).",
     )
 
     # --------------------------------------------------------
@@ -2944,13 +2885,13 @@ def get_args():
     p.add_argument(
         "--llm-epochs",
         type=float,
-        default=2,
+        default=1,
     )
 
     p.add_argument(
         "--llm-batch",
         type=int,
-        default=1,
+        default=100,
     )
 
     p.add_argument(
@@ -3008,13 +2949,13 @@ def get_args():
     p.add_argument(
         "--encoder-epochs",
         type=float,
-        default=3,
+        default=1,
     )
 
     p.add_argument(
         "--encoder-batch",
         type=int,
-        default=8,
+        default=100,
     )
 
     p.add_argument(
@@ -3032,7 +2973,7 @@ def get_args():
     p.add_argument(
         "--max-answer-tokens",
         type=int,
-        default=12,
+        default=100,
     )
 
     return p.parse_args()
@@ -3041,6 +2982,12 @@ def get_args():
 def main():
 
     args = get_args()
+
+    # 0 means no limit / evaluate the full split.
+    if args.max_eval == 0:
+        args.max_eval = None
+    if args.max_val == 0:
+        args.max_val = None
 
     seed_everything(SEED)
 
